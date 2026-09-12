@@ -1,0 +1,167 @@
+--- /tmp/dsh-orig/package/lib/index.js	1985-10-26 16:15:00.000000000 +0800
++++ lib/index.js	2026-09-12 16:33:54.371007142 +0800
+@@ -348,6 +348,54 @@
+             return { efforts: resolveEfforts(undefined), defaultEffort: undefined };
+         }
+     };
++    /** Publish a created or resumed dsh agent as an ACP session in this bridge. */
++    const publishSession = async (handle, sessionId, sourceSelection) => {
++        if (closed) {
++            await handle.dispose();
++            throw internalError('connection closed while publishing a session');
++        }
++        const agent = handle.agent;
++        let catalog = [];
++        try {
++            catalog = await ctx.llm.listModels(catalogProvider);
++        }
++        catch (error) {
++            logger.warn(`acp: model catalog discovery failed: ${errorChain(error)}`);
++        }
++        const currentModelId = pickCurrentModelId(config, catalogProvider, catalog, sourceSelection);
++        const { efforts, defaultEffort } = await resolveSessionEfforts(currentModelId);
++        const pinned = config.provider !== undefined || config.model !== undefined;
++        const selection = {
++            current: {
++                ...(pinned
++                    ? { provider: config.provider ?? catalogProvider, model: config.model ?? currentModelId }
++                    : { ...sourceSelection }),
++                reasoningEffort: ReasoningEffortId(sourceSelection.reasoningEffort ?? defaultEffort ?? efforts[0]?.id ?? 'off'),
++            },
++            assembled: undefined,
++        };
++        const disposeSelection = installModelSelection(agent.ctx, selection);
++        const record = {
++            agent,
++            dispose: () => handle.dispose(),
++            inflight: undefined,
++            selection,
++            disposeSelection,
++            efforts,
++            commandAbort: undefined,
++            inFlightTools: new Set(),
++            broadcastTimers: [],
++        };
++        sessions.set(sessionId, record);
++        scheduleCommandBroadcast(record);
++        const effort = selection.current?.reasoningEffort ?? 'off';
++        return {
++            sessionId,
++            models: buildModelState(catalog, currentModelId),
++            modes: buildModeState(MODE_EXECUTE),
++            configOptions: [buildThoughtLevelOption(effort, efforts)],
++        };
++    };
+     const makeAgent = (connection) => {
+         conn = connection;
+         return {
+@@ -357,6 +405,8 @@
+                     agentInfo: { name: 'dsh-acp-paseo', version: BRIDGE_VERSION },
+                     agentCapabilities: {
+                         promptCapabilities: { image: false, audio: false, embeddedContext: false },
++                        // Paseo drives Side Chat and agent resume through these.
++                        sessionCapabilities: { fork: {}, resume: {} },
+                     },
+                     authMethods: [],
+                 });
+@@ -374,51 +424,41 @@
+                     meta: { cwd: params.cwd },
+                     agentOptions: resolveAgentOptions(config, defaultSelection),
+                 });
+-                if (closed) {
+-                    await handle.dispose();
+-                    throw internalError('connection closed during session/new');
+-                }
+-                const agent = handle.agent;
+-                let catalog = [];
+-                try {
+-                    catalog = await ctx.llm.listModels(catalogProvider);
+-                }
+-                catch (error) {
+-                    logger.warn(`acp: model catalog discovery failed: ${errorChain(error)}`);
+-                }
+-                const currentModelId = pickCurrentModelId(config, catalogProvider, catalog, defaultSelection);
+-                const { efforts, defaultEffort } = await resolveSessionEfforts(currentModelId);
+-                const pinned = config.provider !== undefined || config.model !== undefined;
+-                const selection = {
+-                    current: {
+-                        ...(pinned
+-                            ? { provider: config.provider ?? catalogProvider, model: config.model ?? currentModelId }
+-                            : { ...defaultSelection }),
+-                        reasoningEffort: ReasoningEffortId(defaultSelection.reasoningEffort ?? defaultEffort ?? efforts[0]?.id ?? 'off'),
+-                    },
+-                    assembled: undefined,
+-                };
+-                const disposeSelection = installModelSelection(agent.ctx, selection);
+-                const record = {
+-                    agent,
+-                    dispose: () => handle.dispose(),
+-                    inflight: undefined,
+-                    selection,
+-                    disposeSelection,
+-                    efforts,
+-                    commandAbort: undefined,
+-                    inFlightTools: new Set(),
+-                    broadcastTimers: [],
+-                };
+-                sessions.set(sessionId, record);
+-                scheduleCommandBroadcast(record);
+-                const effort = selection.current?.reasoningEffort ?? 'off';
+-                return {
++                return publishSession(handle, sessionId, defaultSelection);
++            },
++            /**
++             * Fork a live session into an independent one (ACP `session/fork`) so
++             * Paseo can open a Side Chat that carries the parent context without
++             * disturbing the parent turn. dsh validates the seed prefix, so an
++             * in-flight turn is dropped rather than ending the seed inside it.
++             */
++            async unstable_forkSession(params) {
++                assertOpen();
++                validateSessionParams(params);
++                const parent = requireSession(params.sessionId);
++                const sessionId = SessionId(randomUUID());
++                // Read the live session the agent owns; ctx.sessions is not injected here.
++                const seed = forkSeedEvents(parent.agent.session.events);
++                const handle = await agents.create({
+                     sessionId,
+-                    models: buildModelState(catalog, currentModelId),
+-                    modes: buildModeState(MODE_EXECUTE),
+-                    configOptions: [buildThoughtLevelOption(effort, efforts)],
+-                };
++                    meta: { cwd: params.cwd, parentSession: params.sessionId, seedLength: seed.length },
++                    seed,
++                    agentOptions: resolveAgentOptions(config, parent.selection.current),
++                });
++                return publishSession(handle, sessionId, parent.selection.current);
++            },
++            /**
++             * Attach a fresh bridge process to a persisted session (ACP
++             * `session/resume`, no history replay) so a side-chat fork or a
++             * restarted daemon continues the same dsh session.
++             */
++            async unstable_resumeSession(params) {
++                assertOpen();
++                validateSessionParams(params);
++                const sessionId = SessionId(params.sessionId);
++                const defaultSelection = ctx.agentDefaultModel.currentSelection();
++                const handle = await agents.resume({ resumeSessionId: sessionId });
++                return publishSession(handle, sessionId, defaultSelection);
+             },
+             async prompt(params) {
+                 assertOpen();
+@@ -598,6 +638,14 @@
+  * every child turn with "has no provider/model". (Web parity: the web host
+  * passes the same explicit options on every session creation.)
+  */
++/**
++ * Select the fork seed: a completed-turn prefix of the live parent log. dsh
++ * rejects a seed that ends inside an open turn, so an in-flight turn is dropped.
++ */
++function forkSeedEvents(events) {
++    const lastMarker = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
++    return lastMarker?.type === 'turn/start' ? events.slice(0, events.indexOf(lastMarker)) : events.slice();
++}
+ function resolveAgentOptions(config, defaultSelection) {
+     return {
+         provider: config.provider ?? defaultSelection.provider,

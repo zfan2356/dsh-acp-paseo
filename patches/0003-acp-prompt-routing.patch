@@ -1,0 +1,152 @@
+# Patch 0003: prompt routing — slash commands vs. path-leading messages.
+#
+# Applied last, on top of 0001 and 0002. Two independent defects:
+#
+#   1. extractSlashCommand treated any prompt whose trimmed text starts with
+#      '/' as a slash command, so a Paseo message beginning with an absolute
+#      path failed the whole prompt with -32602 and never reached the model.
+#      Detection now mirrors the registry grammar and only routes names the
+#      session actually exposes; everything else is an ordinary message.
+#   2. runSlashCommand passed the abort signal as the registry's 'images'
+#      argument (rc.8 order is agent, line, images, signal), leaving
+#      invocation.signal undefined: every registered command died with
+#      'Internal error: command failed: Cannot read properties of undefined
+#      (reading aborted)'.
+
+--- /tmp/dsh-orig/package/lib/types/codec.d.ts
++++ lib/types/codec.d.ts
+@@ -36,16 +36,24 @@
+  */
+ export declare function promptHasUnsupportedContent(prompt: readonly PromptBlockLike[]): boolean;
+ /**
++ * The command name of a slash line (`/goal set objective` → `goal`); undefined
++ * when the line is not a command, so absolute paths like `/mnt/data/x` are
++ * ordinary messages rather than commands.
++ */
++export declare function slashCommandName(line: string): string | undefined;
++/**
+  * Command Passthrough predicate: a prompt is a slash command exactly when it is
+- * one single text block whose content starts with `/` (after trimming
+- * surrounding whitespace). Any other shape — multiple blocks, resource links,
+- * ordinary prose — is a normal model message even if it contains a `/` later.
++ * one single text block whose content is a well-formed command line (after
++ * trimming surrounding whitespace) that the session's registry knows. Any other
++ * shape — multiple blocks, resource links, ordinary prose, a leading absolute
++ * path — is a normal model message.
+  *
++ * @param prompt - ACP prompt blocks.
++ * @param isRegistered - whether the session exposes that command name; omitted
++ *   means every well-formed command line counts as a command.
+  * @returns the command line to hand to the dsh command registry, or undefined.
+  */
+-export declare function extractSlashCommand(prompt: readonly PromptBlockLike[]): string | undefined;
+-/**
+- * The command name of a slash line (`/goal set objective` → `goal`), for
+- * diagnostics; undefined when the line has no parseable name.
+- */
+-export declare function slashCommandName(line: string): string | undefined;
++export declare function extractSlashCommand(
++    prompt: readonly PromptBlockLike[],
++    isRegistered?: (name: string) => boolean,
++): string | undefined;
+--- /tmp/dsh-orig/package/lib/codec.js
++++ lib/codec.js
+@@ -53,29 +53,40 @@
+     return prompt.some((block) => block.type !== 'text' && block.type !== 'resource_link' && block.type !== 'image');
+ }
+ /**
++ * The command name of a slash line (`/goal set objective` → `goal`); undefined
++ * when the line is not a command, so absolute paths like `/mnt/data/x` are
++ * ordinary messages rather than commands. Mirrors the dsh registry's grammar.
++ */
++export function slashCommandName(line) {
++    const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\s])/u.exec(line);
++    return match?.[1];
++}
++/**
+  * Command Passthrough predicate: a prompt is a slash command exactly when it is
+- * one single text block whose content starts with `/` (after trimming
+- * surrounding whitespace). Any other shape — multiple blocks, resource links,
+- * ordinary prose — is a normal model message even if it contains a `/` later.
++ * one single text block whose content is a well-formed command line (after
++ * trimming surrounding whitespace) that the session's registry knows. Any other
++ * shape — multiple blocks, resource links, ordinary prose, a leading absolute
++ * path — is a normal model message.
++ *
++ * An unknown name is a message too: over ACP there is no composer menu to
++ * correct it, and a path like `/tmp` must never fail the prompt with -32602.
+  *
++ * @param prompt - ACP prompt blocks.
++ * @param isRegistered - whether the session exposes that command name; omitted
++ *   means every well-formed command line counts as a command.
+  * @returns the command line to hand to the dsh command registry, or undefined.
+  */
+-export function extractSlashCommand(prompt) {
++export function extractSlashCommand(prompt, isRegistered) {
+     if (prompt.length !== 1)
+         return undefined;
+     const block = prompt[0];
+     if (block === undefined || block.type !== 'text' || typeof block.text !== 'string')
+         return undefined;
+     const line = block.text.trim();
+-    if (!line.startsWith('/'))
++    const name = slashCommandName(line);
++    if (name === undefined)
++        return undefined;
++    if (isRegistered !== undefined && !isRegistered(name))
+         return undefined;
+     return line;
+ }
+-/**
+- * The command name of a slash line (`/goal set objective` → `goal`), for
+- * diagnostics; undefined when the line has no parseable name.
+- */
+-export function slashCommandName(line) {
+-    const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\s])/u.exec(line);
+-    return match?.[1];
+-}
+--- /tmp/dsh-orig/package/lib/index.js
++++ lib/index.js
+@@ -302,11 +302,10 @@
+             broadcastCommands(record);
+     });
+     /**
+-     * Execute one slash command line through the dsh registry. Unknown names
+-     * fail the prompt with an RPC error (dsh `unknown-command` semantics); a
+-     * known command's error result is rendered as agent text instead, and a
+-     * command that starts a turn (e.g. `/plan <message>`) keeps the ACP turn
+-     * open until the agent is idle again.
++     * Execute one slash command line through the dsh registry. A known command's
++     * error result is rendered as agent text, and a command that starts a turn
++     * (e.g. `/plan <message>`) keeps the ACP turn open until the agent is idle
++     * again; the caller only routes registered names here.
+      */
+     const runSlashCommand = async (record, line) => {
+         if (ctx.agents.get(record.agent.id) !== record.agent) {
+@@ -315,9 +314,12 @@
+         const abort = new AbortController();
+         record.commandAbort = abort;
+         try {
+-            const execution = await ctx.commands.execute(record.agent, line, abort.signal);
++            // rc.8 registry order is (agent, line, images, signal); passing the
++            // signal as `images` left invocation.signal undefined and every
++            // command died with "reading 'aborted'".
++            const execution = await ctx.commands.execute(record.agent, line, [], abort.signal);
+             if (execution === undefined) {
+-                throw invalidParams(`unknown command: /${slashCommandName(line) ?? line}`);
++                throw invalidParams(`unknown command: /${slashCommandName(line) ?? line.trim()}`);
+             }
+             const text = execution.result.text;
+             if (text !== undefined && text.length > 0)
+@@ -495,7 +497,10 @@
+                 }
+                 if (!hasImages && acpPromptToText(params.prompt).trim().length === 0)
+                     throw invalidParams('empty prompt');
+-                const commandLine = extractSlashCommand(params.prompt);
++                const commandLine = extractSlashCommand(
++                    params.prompt,
++                    (name) => ctx.commands.find(record.agent, name) !== undefined,
++                );
+                 if (commandLine !== undefined) {
+                     return { stopReason: await runSlashCommand(record, commandLine) };
+                 }

@@ -1,0 +1,39 @@
+# dsh-acp-paseo bundle patch layer —— 把 dsh 注入成 Paseo 的 ACP provider。
+#
+# 挂载方式（profile bundle 机制，不修改 dsh 源码）：
+#   dsh plugin --profile dsh-acp-paseo add <本 bundle>
+# 之后 profile 的 bundles 为 [@deepseek-ai/dsh-base, dsh-acp-paseo]。
+# base 提供完整 agent 运行时（agent-loop / llm / session / sandbox / bash /
+# 工具全家桶 / subagent / 持久化 / 命令注册表 / plan-mode / goal……），
+# 本层在它之上只做两件事：
+#
+#   1. insert `dsh-acp-paseo` 行：挂载增强 ACP 桥（src/index.ts）。每个
+#      `session/new` 由桥创建一个全新 dsh agent，并在响应里携带模型目录、
+#      execute/plan 模式与 thought_level 选项；stdout 只走 ACP JSON-RPC 帧
+#      （无 stdout logger，诊断走 stderr）。
+#   2. 覆盖 `system-prompt` 行的 persona：为 Paseo 场景提供工作目录感知的
+#      人设（{{model}} / {{cwd}} 由 agent-loop 逐会话插值）。
+#
+# 可调项（`!!js` 只出现在 config 下，符合 Loader 约束）：
+#   DSH_ACP_PASEO_MODEL     —— 显式钉住模型（派生 provider 场景：Paseo 每个
+#                              agent 进程独立设置该变量）；未设置时桥在
+#                              session/new 里暴露 dsh 默认选择，Paseo 端可切
+#   DSH_ACP_PASEO_PROVIDER  —— 同理显式钉住 llm 路由（目录也随之切换）
+#   DSH_PERMISSION_MODE     —— 默认 workspace-write（base 层已读取；同时决定
+#                              approval 策略 ask/never）
+#
+# 行 id `dsh-acp-paseo` 不占用官方入口（tools/session/llm/web/permission 均避开）。
+- insert:
+    - id: dsh-acp-paseo
+      name: 'dsh-acp-paseo'
+      config:
+        provider: !!js "process.env.DSH_ACP_PASEO_PROVIDER"
+        model: !!js "process.env.DSH_ACP_PASEO_MODEL"
+
+# 部署人设是部署选择；tool 插件各自拥有自己的 prompt section。
+- id: system-prompt
+  config:
+    persona: |
+      You are a coding assistant powered by the {{model}} model, driven from Paseo over ACP. Your working directory is {{cwd}}. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
+
+      Verify your work by running the code or tests. Keep answers brief and factual.

@@ -1,0 +1,176 @@
+--- /tmp/dsh-orig/package/lib/codec.js
++++ lib/codec.js
+@@ -28,7 +28,7 @@ export function turnEndToStopReason(reason) {
+ /**
+  * Flatten ACP prompt blocks to text. Text blocks concatenate verbatim;
+  * resource links become explicit bracketed references so the context is never
+- * silently dropped.
++ * silently dropped. Images are carried as dsh blocks by the caller, not here.
+  */
+ export function acpPromptToText(prompt) {
+     return prompt
+@@ -45,11 +45,12 @@ export function acpPromptToText(prompt) {
+         .join('');
+ }
+ /**
+- * Whether a prompt carries content beyond the ACP baseline (text +
+- * resource_link). Richer inline payloads are rejected, never silently dropped.
++ * Whether a prompt carries content beyond the supported ACP set (text,
++ * resource_link, image). Richer inline payloads are rejected, never silently
++ * dropped.
+  */
+ export function promptHasUnsupportedContent(prompt) {
+-    return prompt.some((block) => block.type !== 'text' && block.type !== 'resource_link');
++    return prompt.some((block) => block.type !== 'text' && block.type !== 'resource_link' && block.type !== 'image');
+ }
+ /**
+  * Command Passthrough predicate: a prompt is a slash command exactly when it is
+--- /tmp/dsh-orig/package/lib/index.js
++++ lib/index.js
+@@ -12,7 +12,9 @@
+  *     `reasoningEffort`, switched through `session/set_config_option`,
+  *   - the dsh slash-command registry, broadcast as
+  *     `available_commands_update` and executed in-prompt (Command
+- *     Passthrough), never sent to the model.
++ *     Passthrough), never sent to the model,
++ *   - image prompts (screenshots), admitted into the durable attachment store
++ *     and carried as ordered dsh image blocks.
+  *
+  * Sessions stay fresh-only and connection-owned, mirroring the official
+  * automation bridge's lifetime model.
+@@ -27,6 +29,7 @@ import Schema from '@deepseek-ai/schemastery';
+ import { AgentSideConnection, PROTOCOL_VERSION, RequestError, ndJsonStream, } from '@agentclientprotocol/sdk';
+ import { SessionId } from '@deepseek-ai/dsh-session';
+ import { createUserMessage, errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
++import { admitEncodedImages, isImageAdmissionError } from '@deepseek-ai/dsh-attachment';
+ import { installModelSelection } from '@deepseek-ai/dsh-agent';
+ import '@deepseek-ai/dsh-user-approval';
+ import '@deepseek-ai/dsh-plan-mode';
+@@ -37,7 +40,7 @@ import { DEFAULT_CATALOG_PROVIDER, DEFAULT_COMMAND_BLOCKLIST, MODE_EXECUTE, MODE
+ import { parseToolArguments, renderToolResultText, toolKindForName, toolTitleFor, } from "./tools.js";
+ export const name = 'dsh-acp-paseo';
+ /** The bridge creates and owns agents; every other concern is carried by the composition. */
+-export const inject = ['agents', 'llm', 'commands', 'planMode', 'agentDefaultModel'];
++export const inject = ['agents', 'llm', 'commands', 'planMode', 'agentDefaultModel', 'attachments'];
+ const { version: BRIDGE_VERSION } = readPackageVersion();
+ function readPackageVersion() {
+     try {
+@@ -348,6 +351,24 @@ export function apply(ctx, config) {
+             return { efforts: resolveEfforts(undefined), defaultEffort: undefined };
+         }
+     };
++    /**
++     * Whether the session's selected model advertises image input. Discovery
++     * failure stays permissive: the request path already rejects text-only
++     * models, and a bridge-side guess must not block a capable one.
++     */
++    const sessionAcceptsImages = async (record) => {
++        const current = record.selection.current;
++        if (current === undefined)
++            return true;
++        try {
++            const resolved = await ctx.llm.resolveModelInfo(current.provider ?? catalogProvider, current.model);
++            return resolved.inputModalities === undefined || resolved.inputModalities.includes('image');
++        }
++        catch (error) {
++            logger.warn(`acp: image modality discovery failed: ${errorChain(error)}`);
++            return true;
++        }
++    };
+     /** Publish a created or resumed dsh agent as an ACP session in this bridge. */
+     const publishSession = async (handle, sessionId, sourceSelection) => {
+         if (closed) {
+@@ -404,7 +425,7 @@ export function apply(ctx, config) {
+                     protocolVersion: PROTOCOL_VERSION,
+                     agentInfo: { name: 'dsh-acp-paseo', version: BRIDGE_VERSION },
+                     agentCapabilities: {
+-                        promptCapabilities: { image: false, audio: false, embeddedContext: false },
++                        promptCapabilities: { image: true, audio: false, embeddedContext: false },
+                         // Paseo drives Side Chat and agent resume through these.
+                         sessionCapabilities: { fork: {}, resume: {} },
+                     },
+@@ -466,10 +487,13 @@ export function apply(ctx, config) {
+                 if (record.inflight !== undefined)
+                     throw invalidParams('a prompt is already in flight for this session');
+                 if (promptHasUnsupportedContent(params.prompt)) {
+-                    throw invalidParams('only text and resource_link prompt content is supported');
++                    throw invalidParams('only text, resource_link, and image prompt content is supported');
+                 }
+-                const text = acpPromptToText(params.prompt);
+-                if (text.trim().length === 0)
++                const hasImages = params.prompt.some((block) => block.type === 'image');
++                if (hasImages && !(await sessionAcceptsImages(record))) {
++                    throw invalidParams(`model "${record.selection.current?.model}" does not accept image input`);
++                }
++                if (!hasImages && acpPromptToText(params.prompt).trim().length === 0)
+                     throw invalidParams('empty prompt');
+                 const commandLine = extractSlashCommand(params.prompt);
+                 if (commandLine !== undefined) {
+@@ -478,8 +502,17 @@ export function apply(ctx, config) {
+                 if (ctx.agents.get(record.agent.id) !== record.agent) {
+                     throw internalError('prompt was not queued: the agent was disposed outside the bridge');
+                 }
++                let content;
++                try {
++                    content = await toUserContent(ctx.attachments, params.prompt);
++                }
++                catch (error) {
++                    if (isImageAdmissionError(error))
++                        throw invalidParams(`prompt image rejected: ${error.message}`);
++                    throw internalError(`prompt image could not be stored: ${errorChain(error)}`);
++                }
+                 const message = createUserMessage({
+-                    content: [{ type: 'text', text }],
++                    content,
+                     source: { kind: 'user' },
+                 });
+                 return {
+@@ -652,6 +685,30 @@ function resolveAgentOptions(config, defaultSelection) {
+         model: config.model ?? defaultSelection.model,
+     };
+ }
++/**
++ * Convert one ACP prompt into dsh user content, preserving block order. Images
++ * are admitted as a single batch before any member is published, and a prompt
++ * without text is legal when it carries an image.
++ */
++async function toUserContent(attachments, prompt) {
++    const images = prompt.filter((block) => block.type === 'image');
++    const refs = images.length === 0
++        ? []
++        : await admitEncodedImages(attachments, images.map((block) => ({ mediaType: block.mimeType, data: block.data })));
++    let next = 0;
++    return prompt.flatMap((block) => {
++        switch (block.type) {
++            case 'text':
++                return [{ type: 'text', text: block.text ?? '' }];
++            case 'resource_link':
++                return [{ type: 'text', text: acpPromptToText([block]) }];
++            case 'image':
++                return [{ type: 'image', attachment: refs[next++] }];
++            default:
++                return [];
++        }
++    });
++}
+ /** Reject session features outside the bridge contract. */
+ function validateSessionParams(params) {
+     if (!isAbsolute(params.cwd))
+--- /tmp/dsh-orig/package/package.json
++++ package.json
+@@ -49,6 +49,7 @@
+   "peerDependencies": {
+     "@deepseek-ai/cordis": "^4.0.1",
+     "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
++    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
+     "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+     "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+     "@deepseek-ai/dsh-plan-mode": "^0.1.0-rc.6",
+@@ -61,6 +62,7 @@
+     "@deepseek-ai/cordis": "4.0.1",
+     "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+     "@deepseek-ai/dsh-agent-default-model": "0.1.0-rc.6",
++    "@deepseek-ai/dsh-attachment": "0.1.0-rc.6",
+     "@deepseek-ai/dsh-commands": "0.1.0-rc.6",
+     "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+     "@deepseek-ai/dsh-plan-mode": "0.1.0-rc.6",

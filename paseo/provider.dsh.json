@@ -1,0 +1,10 @@
+{
+  "extends": "acp",
+  "label": "DSH (DeepSeek Harness)",
+  "description": "DeepSeek Harness (dsh) coding agent over ACP — model catalog, plan/execute modes, thinking levels and native slash commands, all auto-discovered from dsh.",
+  "command": ["__DSH_ACP_PASEO_LAUNCH__"],
+  "params": {
+    "supportsMcpServers": false
+  },
+  "enabled": true
+}
