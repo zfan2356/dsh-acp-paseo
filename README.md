@@ -2,8 +2,9 @@
 
 Fork of the published npm package [`dsh-acp-paseo@0.1.0`](https://www.npmjs.com/package/dsh-acp-paseo),
 patched so Paseo can open a **Side Chat** on a dsh (DeepSeek Harness) agent,
-send **screenshot (image) prompts** to an image-capable dsh model, and keep
-**messages that start with a path** (and native slash commands) working.
+send **screenshot (image) prompts** to an image-capable dsh model, keep
+**messages that start with a path** (and native slash commands) working, and
+open a persisted session **with its conversation replayed**.
 
 Repository: <https://github.com/zfan2356/dsh-acp-paseo>
 
@@ -86,6 +87,36 @@ and `lib/types/codec.d.ts`, fixing two defects that made real Paseo messages fai
    `/feedback`) died with
    `-32603 Internal error: command failed: Cannot read properties of undefined (reading 'aborted')`.
 
+## Patch: conversation replay on attach
+
+`patches/0004-acp-session-load-replay.patch` changes `lib/index.js` only.
+
+Paseo keeps agent timelines in daemon memory, so after a daemon restart the only
+surviving copy of a dsh conversation is the session's own event log. Paseo's ACP
+client replays history exclusively on the `loadSession` branch of its resume
+path (`packages/server/src/server/agent/providers/acp-agent.ts` in the Paseo
+fork); the stock bridge advertised only `sessionCapabilities.resume`, so a
+resumed dsh agent opened with an **empty chat** while a cursor or codex agent
+replayed from its provider. Restarting the daemon exposes this every time: the
+agents that were live lose the in-memory timeline they never had to rebuild.
+
+1. `initialize` advertises `agentCapabilities.loadSession`.
+2. `session/load` (SDK `loadSession`) resumes the persisted session through
+   `ctx.agents.resume` and re-sends its transcript as `session/update`
+   notifications before it returns, because Paseo collects updates only while
+   its load request is in flight.
+3. The live event-to-update mapping moved into one `translateSessionEvent`, used
+   by both the streaming handler and the replay, so a replayed conversation
+   renders with the shapes it had while it was live. Assistant chunks now carry
+   the dsh message id, which is what Paseo groups a message's chunks by.
+4. The replay sends the user turns the live path never echoes (Paseo records the
+   prompt it submitted), and skips `assistant/chunk` deltas because the
+   `assistant/message` that closes the step carries the same text in full.
+
+`session/resume` is unchanged, so a Side Chat still attaches without replaying
+the parent context it forked from; Paseo marks side-chat history primed and skips
+provider hydration, which is what keeps the inherited turns hidden.
+
 ## Layout
 
 - `lib/`, `bin/`, `scripts/`, `paseo/`, `cordis.patch.yml`, `package.json` —
@@ -100,6 +131,12 @@ and `lib/types/codec.d.ts`, fixing two defects that made real Paseo messages fai
 - `test-acp-fork.mjs` — dependency-free ACP client that boots
   `dsh --profile dsh-acp-paseo`, checks the advertised capabilities, forks twice,
   and resumes the forked session from a second process.
+- `test-acp-load.mjs` — dependency-free ACP client that writes a hand-built
+  session log into an isolated `$DSH_HOME` and proves `session/load` replays it:
+  the user turn, the reasoning, the assistant answer and the tool call/result all
+  arrive, in order, before the response, and a second process replays the same
+  conversation. No dsh process is shared with the real home, so it spends no
+  tokens and never touches a live conversation.
 - `test-acp-image.mjs` — same client, checks the image capability bit, sends a
   generated PNG to an image-capable model and requires a vision answer, then
   asserts the text-only-model, audio-block, and blank-prompt rejections.
@@ -110,12 +147,15 @@ and `lib/types/codec.d.ts`, fixing two defects that made real Paseo messages fai
 node test-codec.mjs
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-command-path.mjs /root/wxg
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-fork.mjs /root/wxg
+PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-load.mjs /root/wxg
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-image.mjs /root/wxg
 ```
 
 Expected tail of each: `ALL CHECKS PASSED`. `test-acp-image.mjs` runs one real
 text turn and one real vision turn, and `test-acp-command-path.mjs` two real
-turns, so those two spend tokens.
+turns, so those two spend tokens. `test-acp-load.mjs` builds its own session log
+and overlays this repository's `lib/` on a copied profile, so it checks the
+working tree without spending tokens.
 
 The ACP tests boot dsh with `$DSH_HOME`; dsh rewrites `$DSH_HOME/profiles/<name>/cordis.yml`
 at boot, so point it at a writable copy of the profile when the real home is not
@@ -125,6 +165,10 @@ writable:
 export DSH_HOME=/root/wxg/.dsh-acp-test   # cp -r /root/.dsh/{profiles,.env,.credentials.yaml,settings.yaml} there
 ```
 
+`test-acp-load.mjs` takes its isolated home from `DSH_TEST_HOME` (default
+`/root/wxg/.dsh-acp-test`) and creates it on first run, because `DSH_HOME`
+already points at the real home in a dsh session's environment.
+
 ## Reapply after an upstream update
 
 ```bash
@@ -133,6 +177,7 @@ cd package
 patch -p0 < /path/to/patches/0001-acp-session-fork-and-resume.patch
 patch -p0 < /path/to/patches/0002-acp-image-prompt-support.patch
 patch -p0 < /path/to/patches/0003-acp-prompt-routing.patch
+patch -p0 < /path/to/patches/0004-acp-session-load-replay.patch
 ```
 
 ## Deploy
