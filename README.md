@@ -59,6 +59,20 @@ bytes, and `llm-deepseek` serializes them for models whose catalog entry lists
 `deepseek-v4-pro` rejects images with `UNSUPPORTED_CONTENT`). Only the ACP bridge
 was dropping them.
 
+## Patch: oversized image normalization
+
+`patches/0005-acp-image-normalization.patch` changes `lib/index.js`,
+adds `lib/image-normalizer.js`, and adds `sharp` as a runtime dependency.
+
+DSH deliberately refuses images with an intrinsic side above 2000px because
+such an attachment remains in session history and can make later multimodal
+requests fail. Retina and phone screenshots commonly exceed that limit even
+when their encoded files are small. The bridge now downsizes oversized JPEG,
+PNG, and WebP prompt images proportionally before admission. Images already
+within the limit keep their original bytes, while malformed, unsupported, or
+over-pixel-budget inputs remain unchanged so the attachment store still owns
+their normal validation errors.
+
 ## Patch: prompt routing — paths vs. slash commands
 
 `patches/0003-acp-prompt-routing.patch` changes `lib/index.js`, `lib/codec.js`,
@@ -140,11 +154,15 @@ provider hydration, which is what keeps the inherited turns hidden.
 - `test-acp-image.mjs` — same client, checks the image capability bit, sends a
   generated PNG to an image-capable model and requires a vision answer, then
   asserts the text-only-model, audio-block, and blank-prompt rejections.
+- `test-image-normalizer.mjs` — pure local check that downsizes a 1200×2400 PNG
+  to 1000×2000, preserves an in-limit image unchanged, and leaves malformed
+  base64 for the attachment store to reject. No dsh process or tokens.
 
 ## Verify
 
 ```bash
 node test-codec.mjs
+node test-image-normalizer.mjs
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-command-path.mjs /root/wxg
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-fork.mjs /root/wxg
 PATH="/root/.local/dsh-paseo/bin:$PATH" node test-acp-load.mjs /root/wxg
@@ -178,6 +196,7 @@ patch -p0 < /path/to/patches/0001-acp-session-fork-and-resume.patch
 patch -p0 < /path/to/patches/0002-acp-image-prompt-support.patch
 patch -p0 < /path/to/patches/0003-acp-prompt-routing.patch
 patch -p0 < /path/to/patches/0004-acp-session-load-replay.patch
+patch -p0 < /path/to/patches/0005-acp-image-normalization.patch
 ```
 
 ## Deploy

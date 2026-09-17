@@ -44,7 +44,8 @@
     "node": ">=22.19"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "0.17.1"
+    "@agentclientprotocol/sdk": "0.17.1",
+    "sharp": "0.35.4"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
