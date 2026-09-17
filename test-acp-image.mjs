@@ -133,7 +133,9 @@ function assert(condition, message) {
   console.log(`  ok: ${message}`)
 }
 
-const PNG_RED = solidPng(64, 64, [220, 30, 30])
+// Deliberately exceeds DSH's 2000px side limit so this also exercises the
+// bridge's pre-admission normalization path.
+const PNG_RED = solidPng(1200, 2400, [220, 30, 30])
 const imageBlock = { type: 'image', data: PNG_RED.toString('base64'), mimeType: 'image/png' }
 
 function agentText(notifications) {

@@ -151,9 +151,10 @@ provider hydration, which is what keeps the inherited turns hidden.
   arrive, in order, before the response, and a second process replays the same
   conversation. No dsh process is shared with the real home, so it spends no
   tokens and never touches a live conversation.
-- `test-acp-image.mjs` — same client, checks the image capability bit, sends a
-  generated PNG to an image-capable model and requires a vision answer, then
-  asserts the text-only-model, audio-block, and blank-prompt rejections.
+- `test-acp-image.mjs` — same client, checks the image capability bit, sends an
+  oversized generated PNG to an image-capable model and requires a vision
+  answer after normalization, then asserts the text-only-model, audio-block,
+  and blank-prompt rejections.
 - `test-image-normalizer.mjs` — pure local check that downsizes a 1200×2400 PNG
   to 1000×2000, preserves an in-limit image unchanged, and leaves malformed
   base64 for the attachment store to reject. No dsh process or tokens.
