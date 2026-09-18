@@ -131,6 +131,25 @@ agents that were live lose the in-memory timeline they never had to rebuild.
 the parent context it forked from; Paseo marks side-chat history primed and skips
 provider hydration, which is what keeps the inherited turns hidden.
 
+## Patch: DSH 0.1.5 session-v3 APIs
+
+`patches/0006-dsh-session-v3-api.patch` updates history reads and fork metadata
+for DSH 0.1.5 (validated with `dsh-session@0.1.5-rc.2`). The old public
+`session.events` property has been removed. Both history replay and fork seed
+selection now call `session.snapshotEvents()`; otherwise a restored chat fails
+with `Internal error: events is not iterable` after a daemon restart.
+
+Fork creation also uses `meta.isSeeded: true` and the top-level
+`inheritedEventCount`, replacing the retired `meta.seedLength`. Reading the new
+snapshot API alone restores chats but silently leaves new forks marked unseeded.
+The replay regression now checks durable fork lineage and its inherited-event
+boundary, then reloads the parent and fork from a second process. Tests clean up
+their own child processes even when an assertion fails.
+
+This patch requires the session-v3 API; it does not rewrite existing session
+logs or downgrade DSH. Apply it to both the live profile and the install seed,
+then reload only affected Paseo agents. The daemon does not need restarting.
+
 ## Layout
 
 - `lib/`, `bin/`, `scripts/`, `paseo/`, `cordis.patch.yml`, `package.json` —
@@ -198,6 +217,7 @@ patch -p0 < /path/to/patches/0002-acp-image-prompt-support.patch
 patch -p0 < /path/to/patches/0003-acp-prompt-routing.patch
 patch -p0 < /path/to/patches/0004-acp-session-load-replay.patch
 patch -p0 < /path/to/patches/0005-acp-image-normalization.patch
+patch -p0 < /path/to/patches/0006-dsh-session-v3-api.patch
 ```
 
 ## Deploy

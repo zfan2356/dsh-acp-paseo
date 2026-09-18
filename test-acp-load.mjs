@@ -12,7 +12,7 @@
  * Usage: node test-acp-load.mjs [cwd]
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,6 +22,7 @@ const REPO_ROOT = dirname(fileURLToPath(import.meta.url))
 const CWD = process.argv[2] ?? '/root/wxg'
 const DSH = process.env.DSH_BIN ?? 'dsh'
 const PROFILE = process.env.DSH_PROFILE ?? 'dsh-acp-paseo'
+const runningAgents = new Set()
 const REAL_HOME = process.env.DSH_REAL_HOME ?? '/root/.dsh'
 /** Isolated home for the fixture. Deliberately not `DSH_HOME`: dsh exports that
  *  as the real home, and this check must never write into it. */
@@ -60,6 +61,16 @@ function zstdCompress(buffer) {
   const proc = spawnSync('zstd', ['-q', '-c'], { input: buffer, maxBuffer: 64 * 1024 * 1024 })
   if (proc.status !== 0) fail(`zstd compression failed: ${proc.stderr}`)
   return proc.stdout
+}
+
+function readStoredSession(sessionId) {
+  const folder = join(DSH_HOME, 'sessions', sessionBucket(CWD), sessionId)
+  const migrated = join(folder, 'session.v3.jsonl.zstd')
+  const path = existsSync(migrated) ? migrated : join(folder, 'session.jsonl.zstd')
+  const compressed = readFileSync(path)
+  const proc = spawnSync('zstd', ['-q', '-d', '-c'], { input: compressed })
+  if (proc.status !== 0) fail(`zstd decompression failed: ${proc.stderr}`)
+  return proc.stdout.toString('utf8').trim().split('\n').map((line) => JSON.parse(line))
 }
 
 /**
@@ -273,6 +284,7 @@ function startAgent() {
 
   const stop = () =>
     new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve()
       child.once('exit', resolve)
       child.kill('SIGTERM')
       setTimeout(() => {
@@ -281,7 +293,9 @@ function startAgent() {
       }, 10_000).unref()
     })
 
-  return { request, stop, notifications, stderr }
+  const agent = { request, stop, notifications, stderr }
+  runningAgents.add(agent)
+  return agent
 }
 
 /** Text of an ACP content chunk, ignoring unrelated update kinds. */
@@ -321,7 +335,18 @@ try {
 
   // Give the command-broadcast ladder time to land before draining.
   await new Promise((resolve) => setTimeout(resolve, 1200))
+  const forked = await agent.request('session/fork', { sessionId: SESSION_ID, cwd: CWD, mcpServers: [] })
+  assert(forked.sessionId !== SESSION_ID, 'fork of restored history has a separate identity')
   await agent.stop()
+
+  const [forkHeader, ...forkEvents] = readStoredSession(forked.sessionId)
+  assert(forkHeader.parentSession === SESSION_ID, 'fork keeps its parent lineage')
+  assert(forkHeader.isSeeded === true, 'fork header marks its inherited history')
+  assert(!Object.hasOwn(forkHeader, 'seedLength'), 'fork does not write retired seedLength metadata')
+  assert(
+    forkEvents.some((event) => event.type === 'session/end-seed' && event.data.inherited === true && event.seq > 0),
+    'fork persists the inherited event boundary',
+  )
 
   const replayed = agent.notifications
     .map((params) => params.update)
@@ -374,15 +399,24 @@ try {
   })
   await again.request('session/load', { sessionId: SESSION_ID, cwd: CWD, mcpServers: [] })
   await new Promise((resolve) => setTimeout(resolve, 300))
-  await again.stop()
   const secondText = again.notifications
     .map((params) => params.update)
     .filter((u) => u?.sessionUpdate === 'agent_message_chunk')
     .map(chunkText)
   assert(secondText.includes(ANSWER), 'a fresh process replays the same conversation')
 
+  again.notifications.length = 0
+  await again.request('session/load', { sessionId: forked.sessionId, cwd: CWD, mcpServers: [] })
+  assert(
+    again.notifications.some(({ update }) => update?.sessionUpdate === 'agent_message_chunk' && chunkText(update) === ANSWER),
+    'a fresh process replays the fork with its inherited answer',
+  )
+  await again.stop()
+
   console.log('\nALL CHECKS PASSED')
 } catch (error) {
   console.error(`\nFAILED: ${error.message}`)
   process.exitCode = 1
+} finally {
+  await Promise.all([...runningAgents].map((agent) => agent.stop()))
 }

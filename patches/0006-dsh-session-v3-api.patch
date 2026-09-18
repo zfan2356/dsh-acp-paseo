@@ -1,0 +1,32 @@
+# Patch 0006: DSH 0.1.5 session-v3 snapshot and fork metadata APIs.
+# Apply after patches 0001..0005. The live session no longer exposes .events;
+# forks also require isSeeded plus the top-level inheritedEventCount.
+
+diff --git lib/index.js lib/index.js
+index d765380..7cab618 100644
+--- lib/index.js
++++ lib/index.js
+@@ -531,11 +531,12 @@ export function apply(ctx, config) {
+                 const parent = requireSession(params.sessionId);
+                 const sessionId = SessionId(randomUUID());
+                 // Read the live session the agent owns; ctx.sessions is not injected here.
+-                const seed = forkSeedEvents(parent.agent.session.events);
++                const seed = forkSeedEvents(parent.agent.session.snapshotEvents());
+                 const handle = await agents.create({
+                     sessionId,
+-                    meta: { cwd: params.cwd, parentSession: params.sessionId, seedLength: seed.length },
++                    meta: { cwd: params.cwd, parentSession: params.sessionId, isSeeded: true },
+                     seed,
++                    inheritedEventCount: seed.length,
+                     agentOptions: resolveAgentOptions(config, parent.selection.current),
+                 });
+                 return publishSession(handle, sessionId, parent.selection.current);
+@@ -572,7 +573,7 @@ export function apply(ctx, config) {
+                 // updates it receives while the load request is in flight.
+                 const record = sessions.get(sessionId);
+                 if (record !== undefined)
+-                    replayTranscript(record, record.agent.session.events);
++                    replayTranscript(record, record.agent.session.snapshotEvents());
+                 return response;
+             },
+             async prompt(params) {

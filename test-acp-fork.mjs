@@ -12,6 +12,7 @@ import { createInterface } from 'node:readline'
 const CWD = process.argv[2] ?? '/root/wxg'
 const DSH = process.env.DSH_BIN ?? 'dsh'
 const PROFILE = process.env.DSH_PROFILE ?? 'dsh-acp-paseo'
+const runningAgents = new Set()
 
 function startAgent() {
   const child = spawn(DSH, ['--profile', PROFILE], {
@@ -68,6 +69,7 @@ function startAgent() {
 
   const stop = () =>
     new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve()
       child.once('exit', resolve)
       child.kill('SIGTERM')
       setTimeout(() => {
@@ -76,7 +78,9 @@ function startAgent() {
       }, 10_000).unref()
     })
 
-  return { request, stop, stderr }
+  const agent = { request, stop, stderr }
+  runningAgents.add(agent)
+  return agent
 }
 
 function assert(condition, message) {
@@ -125,4 +129,6 @@ try {
   failures.push(error)
   console.error(`\nFAILED: ${error.message}`)
   process.exitCode = 1
+} finally {
+  await Promise.all([...runningAgents].map((agent) => agent.stop()))
 }
